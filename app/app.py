@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Flask Transcription App using Faster-Whisper
+Streamlit Transcription App using Faster-Whisper
 Supports Apple Silicon (Metal) and NVIDIA GPUs with automatic CPU fallback
 """
 
@@ -9,339 +9,293 @@ import sys
 import platform
 import traceback
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify, send_file, session
+import streamlit as st
 from faster_whisper import WhisperModel
 import torch
 import tempfile
-import uuid
-import atexit
-from werkzeug.utils import secure_filename
-import time
 
-# Initialize Flask app
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+# Page configuration
+st.set_page_config(
+    page_title="Audio Transcription",
+    page_icon="🎙️",
+    layout="centered"
+)
 
 # Global variables for model caching
-current_model = None
-current_model_size = None
-device = None
-compute_type = None
-device_info = None
-
-# Create upload and temp directories
-UPLOAD_FOLDER = Path('uploads')
-TEMP_FOLDER = Path('temp')
-UPLOAD_FOLDER.mkdir(exist_ok=True)
-TEMP_FOLDER.mkdir(exist_ok=True)
-
-app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
-app.config['TEMP_FOLDER'] = str(TEMP_FOLDER)
-
-# Cleanup function for temporary files
-def cleanup_temp_files():
-    """Clean up temporary files on app exit"""
-    for folder in [UPLOAD_FOLDER, TEMP_FOLDER]:
-        if folder.exists():
-            for file in folder.glob('*'):
-                try:
-                    file.unlink()
-                except:
-                    pass
-
-atexit.register(cleanup_temp_files)
+if 'current_model' not in st.session_state:
+    st.session_state.current_model = None
+if 'current_model_size' not in st.session_state:
+    st.session_state.current_model_size = None
+if 'device' not in st.session_state:
+    st.session_state.device = None
+if 'compute_type' not in st.session_state:
+    st.session_state.compute_type = None
 
 def detect_device_and_compute_type():
     """
     Detect available hardware and return appropriate device and compute type.
     Supports: Apple Metal (MPS), NVIDIA CUDA, CPU fallback.
     """
-    global device, compute_type, device_info
-    
-    if device is not None:
-        return device, compute_type
-    
     system = platform.system()
     
     # Check for Apple Silicon (MPS/Metal support)
     if system == "Darwin" and torch.backends.mps.is_available():
         try:
+            # Test MPS availability
             torch.zeros(1).to('mps')
-            device = "cpu"
-            compute_type = "int8"
-            device_info = f"🔵 Apple Silicon (CPU with int8 optimization)"
-            return device, compute_type
+            return "cpu", "int8"  # faster-whisper uses CPU with int8 for best compatibility
         except Exception:
             pass
     
     # Check for CUDA (NVIDIA GPU)
     if torch.cuda.is_available():
         try:
+            # Test CUDA availability
             torch.zeros(1).to('cuda')
-            device = "cuda"
-            compute_type = "float16"
-            device_info = f"🟢 NVIDIA GPU (CUDA - float16)"
-            return device, compute_type
+            return "cuda", "float16"
         except Exception:
             pass
     
     # Fallback to CPU
-    device = "cpu"
-    compute_type = "int8"
-    device_info = f"🟡 CPU (int8)"
-    return device, compute_type
+    return "cpu", "int8"
 
 def load_whisper_model(model_size):
     """
     Load or reuse the Whisper model based on the selected size.
     Handles device detection and model caching.
     """
-    global current_model, current_model_size, device, compute_type, device_info
-    
     # Detect device if not already done
-    if device is None:
-        detect_device_and_compute_type()
+    if st.session_state.device is None:
+        device, compute_type = detect_device_and_compute_type()
+        st.session_state.device = device
+        st.session_state.compute_type = compute_type
+        
+        # Store device info for display
+        if device == "cuda":
+            st.session_state.device_info = f"🟢 NVIDIA GPU (CUDA - {compute_type})"
+        elif platform.system() == "Darwin" and torch.backends.mps.is_available():
+            st.session_state.device_info = f"🔵 Apple Silicon (CPU with {compute_type} optimization)"
+        else:
+            st.session_state.device_info = f"🟡 CPU ({compute_type})"
     
     # Reload model only if size changed
-    if current_model is None or current_model_size != model_size:
+    if (st.session_state.current_model is None or 
+        st.session_state.current_model_size != model_size):
+        
         try:
-            print(f"Loading {model_size} model... This may take a moment.")
-            current_model = WhisperModel(
-                model_size,
-                device=device,
-                compute_type=compute_type
-            )
-            current_model_size = model_size
+            with st.spinner(f"Loading {model_size} model... This may take a moment on first run."):
+                st.session_state.current_model = WhisperModel(
+                    model_size,
+                    device=st.session_state.device,
+                    compute_type=st.session_state.compute_type
+                )
+                st.session_state.current_model_size = model_size
         except Exception as e:
             # Fallback to CPU if initial device fails
-            if device != "cpu":
-                print(f"Failed to load with {device}. Falling back to CPU.")
-                device = "cpu"
-                compute_type = "int8"
-                device_info = "🟡 CPU (int8) - Fallback"
+            if st.session_state.device != "cpu":
+                st.warning(f"Failed to load with {st.session_state.device}. Falling back to CPU.")
+                st.session_state.device = "cpu"
+                st.session_state.compute_type = "int8"
+                st.session_state.device_info = "🟡 CPU (int8) - Fallback"
                 
                 try:
-                    current_model = WhisperModel(
+                    st.session_state.current_model = WhisperModel(
                         model_size,
                         device="cpu",
                         compute_type="int8"
                     )
-                    current_model_size = model_size
+                    st.session_state.current_model_size = model_size
                 except Exception as e2:
-                    print(f"Error loading model: {str(e2)}")
-                    return None, str(e2)
+                    st.error(f"Error loading model: {str(e2)}")
+                    return None
             else:
-                print(f"Error loading model: {str(e)}")
-                return None, str(e)
+                st.error(f"Error loading model: {str(e)}")
+                return None
     
-    return current_model, None
+    return st.session_state.current_model
 
 def validate_audio_file(file_path):
     """
     Validate the uploaded audio file.
-    Returns the file path if valid, or error message.
+    Returns the file path if valid.
     """
     if not file_path:
-        return None, "No file path provided"
+        st.error("No file path provided")
+        return None
     
     path = Path(file_path)
     
     if not path.exists():
-        return None, "File does not exist"
+        st.error("File does not exist")
+        return None
     
     if not path.is_file():
-        return None, "Path is not a file"
+        st.error("Path is not a file")
+        return None
     
     valid_extensions = ['.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac']
     if path.suffix.lower() not in valid_extensions:
-        return None, f"Invalid file format. Supported formats: {', '.join(valid_extensions)}"
+        st.error(f"Invalid file format. Supported formats: {', '.join(valid_extensions)}")
+        return None
     
-    return str(path.absolute()), None
+    return str(path.absolute())
 
-@app.route('/')
-def index():
-    """Render main page"""
-    # Detect hardware on first load
-    if device_info is None:
-        detect_device_and_compute_type()
-    
-    return render_template('index.html', 
-                         device_info=device_info,
-                         current_model_size=current_model_size)
-
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    """Handle file upload"""
+def transcribe_audio(audio_file_path, model_size, language):
+    """
+    Transcribe audio file using the Whisper model.
+    Returns the transcription text.
+    """
     try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file part'}), 400
+        model = load_whisper_model(model_size)
         
-        file = request.files['file']
+        if model is None:
+            return None
         
-        if file.filename == '':
-            return jsonify({'error': 'No selected file'}), 400
-        
-        if file:
-            # Generate unique filename
-            original_filename = secure_filename(file.filename)
-            file_extension = Path(original_filename).suffix
-            unique_filename = f"{uuid.uuid4()}{file_extension}"
-            file_path = Path(app.config['UPLOAD_FOLDER']) / unique_filename
-            
-            # Save file
-            file.save(str(file_path))
-            
-            # Validate file
-            valid_path, error = validate_audio_file(str(file_path))
-            if error:
-                file_path.unlink(missing_ok=True)
-                return jsonify({'error': error}), 400
-            
-            return jsonify({
-                'success': True,
-                'filename': unique_filename,
-                'original_name': original_filename
-            })
-    
-    except Exception as e:
-        return jsonify({'error': f'Upload error: {str(e)}'}), 500
-
-@app.route('/transcribe', methods=['POST'])
-def transcribe():
-    """Handle transcription request"""
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        filename = data.get('filename')
-        model_size = data.get('model_size', 'large-v3')
-        language = data.get('language', None)
-        
-        if not filename:
-            return jsonify({'error': 'No filename provided'}), 400
-        
-        # Construct file path
-        file_path = Path(app.config['UPLOAD_FOLDER']) / filename
-        
-        # Validate file
-        valid_path, error = validate_audio_file(str(file_path))
-        if error:
-            return jsonify({'error': error}), 400
-        
-        # Load model
-        model, error = load_whisper_model(model_size)
-        if error:
-            return jsonify({'error': f'Model loading error: {error}'}), 500
+        file_path = validate_audio_file(audio_file_path)
+        if file_path is None:
+            return None
         
         # Set language parameter
-        lang_param = language if language and language != "auto" else None
+        lang_param = language if language != "Auto-detect" else None
         
-        # Perform transcription
-        print(f"Transcribing audio file: {filename}")
-        segments, info = model.transcribe(
-            str(valid_path),
-            language=lang_param,
-            beam_size=5,
-            vad_filter=True
+        with st.spinner("Transcribing audio... This may take a few minutes."):
+            segments, _ = model.transcribe(
+                file_path,
+                language=lang_param,
+                beam_size=5,
+                vad_filter=True
+            )
+            
+            full_text = []
+            for segment in segments:
+                full_text.append(segment.text)
+            
+            return " ".join(full_text)
+            
+    except Exception as e:
+        st.error(f"Transcription error: {str(e)}")
+        return None
+
+def save_transcription(text, output_path="transcription.txt"):
+    """
+    Save transcription to a text file.
+    Returns the file content as bytes for download.
+    """
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    
+    with open(output_path, 'rb') as f:
+        return f.read()
+
+def main():
+    """
+    Main Streamlit application.
+    """
+    st.title("🎙️ Audio Transcription App")
+    st.markdown("Powered by Faster-Whisper")
+    
+    # Display device information
+    #if st.session_state.device_info:
+    #   st.info(f"**Hardware:** {st.session_state.device_info}")
+    
+    # Sidebar configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        # Model size selection
+        model_size = st.selectbox(
+            "Model Size",
+            options=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+            index=5,  # Default to large-v3
+            help="Larger models are more accurate but slower"
         )
         
-        # Collect transcription text
-        full_text = []
-        for segment in segments:
-            full_text.append(segment.text)
-        
-        transcription = " ".join(full_text)
-        
-        # Save transcription to temp file for download
-        transcription_filename = f"transcription_{uuid.uuid4()}.txt"
-        transcription_path = Path(app.config['TEMP_FOLDER']) / transcription_filename
-        
-        with open(transcription_path, 'w', encoding='utf-8') as f:
-            f.write(transcription)
-        
-        return jsonify({
-            'success': True,
-            'transcription': transcription,
-            'download_filename': transcription_filename,
-            'language_detected': info.language if hasattr(info, 'language') else None
-        })
-    
-    except Exception as e:
-        print(f"Transcription error: {str(e)}")
-        print(traceback.format_exc())
-        return jsonify({'error': f'Transcription error: {str(e)}'}), 500
-
-@app.route('/download/<filename>')
-def download_file(filename):
-    """Download transcription file"""
-    try:
-        file_path = Path(app.config['TEMP_FOLDER']) / filename
-        
-        if not file_path.exists():
-            return jsonify({'error': 'File not found'}), 404
-        
-        return send_file(
-            str(file_path),
-            as_attachment=True,
-            download_name='transcription.txt',
-            mimetype='text/plain'
+        # Language selection
+        languages = ["Auto-detect", "en", "ro", "fr", "de", "es", "it", "pt", "nl", "ru", "zh", "ja", "ko"]
+        language = st.selectbox(
+            "Language",
+            options=languages,
+            index=2 if "ro" in languages else 0,  # Default to Romanian if available
+            help="Select source language or auto-detect"
         )
-    
-    except Exception as e:
-        return jsonify({'error': f'Download error: {str(e)}'}), 500
-
-@app.route('/status')
-def status():
-    """Get current app status"""
-    return jsonify({
-        'device_info': device_info,
-        'current_model': current_model_size,
-        'device': device,
-        'compute_type': compute_type
-    })
-
-@app.route('/cleanup', methods=['POST'])
-def cleanup():
-    """Clean up uploaded and temp files"""
-    try:
-        data = request.get_json()
-        filename = data.get('filename') if data else None
         
-        if filename:
-            # Clean specific file
-            file_path = Path(app.config['UPLOAD_FOLDER']) / filename
-            file_path.unlink(missing_ok=True)
+        st.divider()
         
-        return jsonify({'success': True})
+        st.markdown("### 📋 Model Information")
+        st.markdown(f"- Current model: **{model_size}**")
+        st.markdown(f"- Language: **{language}**")
+        
+        if st.session_state.current_model_size:
+            st.markdown(f"- Loaded model: **{st.session_state.current_model_size}**")
     
-    except Exception as e:
-        return jsonify({'error': f'Cleanup error: {str(e)}'}), 500
-
-# Error handlers
-@app.errorhandler(413)
-def too_large(e):
-    return jsonify({'error': 'File is too large. Maximum size is 500MB.'}), 413
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({'error': 'Resource not found'}), 404
-
-@app.errorhandler(500)
-def server_error(e):
-    return jsonify({'error': 'Internal server error'}), 500
-
-if __name__ == '__main__':
-    # Detect hardware on startup
-    detect_device_and_compute_type()
-    print(f"Hardware detected: {device_info}")
-    print(f"Starting Flask transcription server...")
-    
-    # Run the app
-    app.run(
-        host='0.0.0.0',  # Allow external connections
-        port=5003,
-        debug=True  # Set to False in production
+    # Main content area
+    uploaded_file = st.file_uploader(
+        "Upload an audio file",
+        type=['mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac'],
+        help="Supported formats: MP3, WAV, M4A, FLAC, OGG, AAC"
     )
+    
+    if uploaded_file is not None:
+        # Save uploaded file to temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            temp_path = tmp_file.name
+        
+        # Display audio player
+        st.audio(uploaded_file, format=f'audio/{Path(uploaded_file.name).suffix[1:]}')
+        
+        # Transcribe button
+        if st.button("🔍 Transcribe Audio", type="primary", use_container_width=True):
+            transcription = transcribe_audio(temp_path, model_size, language)
+            
+            if transcription:
+                st.success("✅ Transcription completed successfully!")
+                
+                # Display transcription
+                st.markdown("### 📝 Transcription")
+                st.text_area(
+                    "Transcription Result",
+                    transcription,
+                    height=300,
+                    key="transcription_result"
+                )
+                
+                # Save and provide download button
+                file_content = save_transcription(transcription)
+                
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col1:
+                    st.download_button(
+                        label="📥 Download as TXT",
+                        data=file_content,
+                        file_name="transcription.txt",
+                        mime="text/plain",
+                        use_container_width=True
+                    )
+                
+                with col2:
+                    # Copy to clipboard (using JavaScript)
+                    st.markdown(f"""
+                    <button onclick="navigator.clipboard.writeText(`{transcription.replace('`', '\\`')}`)" 
+                            style="width:100%; padding:0.5rem; border-radius:0.5rem; border:1px solid #ccc; background-color:#f0f2f6; cursor:pointer;">
+                        📋 Copy to Clipboard
+                    </button>
+                    """, unsafe_allow_html=True)
+        
+        # Clean up temporary file
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+
+    # Footer
+    st.divider()
+    st.markdown("""
+    <div style='text-align: center; color: #888;'>
+        <small>Transcription app using Faster-Whisper | 
+        Supports GPU acceleration on Apple Silicon and NVIDIA GPUs</small>
+    </div>
+    """, unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
